@@ -1,0 +1,6 @@
+{
+  "name": "task-monitor",
+  "version": "0.1.0",
+  "description": "Terminal panel with foreground and background tasks (subagents, background shells, long tool calls), their time and tokens, plus a context, token and 5-hour limit meter under the prompt.",
+  "types": "./types/index.d.ts"
+}

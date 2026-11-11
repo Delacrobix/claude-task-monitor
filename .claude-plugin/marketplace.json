@@ -1,0 +1,11 @@
+{
+  "name": "claude-task-monitor",
+  "owner": { "name": "Delacrobix" },
+  "plugins": [
+    {
+      "name": "task-monitor",
+      "source": "./",
+      "description": "Terminal panel with foreground and background tasks, their time and tokens, plus a context, token and 5-hour limit meter under the prompt."
+    }
+  ]
+}
