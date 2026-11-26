@@ -35,10 +35,10 @@ At the bottom of the panel, in small dim type, is the memory the Claude Code pro
 **Usage meter** (bottom right, under the prompt)
 
 ```
-tokens 1.2M↓ 34k↑  ·  5h ▰▰▱▱▱ 42% ↻ 2h 14m  ·  week ▰▱▱▱▱ 18% ↻ 3d 4h  ·  fable ▰▱▱▱▱ 27% ↻ 5d 0h  ·  context ▰▰▰▰▱▱▱▱▱▱ 38% 76k/200k
+tokens 1.2M↓ 34k↑  ·  5h ▰▰▱▱▱ 42% ↻ 2h 14m  ·  week ▰▱▱▱▱ 18% ↻ 3d 4h  ·  context ▰▰▰▰▱▱▱▱▱▱ 38% 76k/200k
 ```
 
-Session tokens in and out, the 5-hour and weekly usage limits (on a subscription) with the time left until each resets (↻), the per-model weekly limits your plan has (Fable, Opus, Sonnet), and how full the context window is. Bars turn amber from 60% and red from 85%. On narrow terminals the meter drops detail to fit.
+Session tokens in and out, the 5-hour and weekly usage limits (on a subscription) with the time left until each resets (↻), and how full the context window is. Bars turn amber from 60% and red from 85%. On narrow terminals the meter drops detail to fit.
 
 Click the `−` at its end (or run `/task-monitor compact`) for the compact meter, and `+` to bring the full one back:
 
@@ -82,6 +82,7 @@ The panel opens by itself when the terminal is at least 144 columns wide; on nar
 - A subagent's token figure is the context of its latest request plus all the output it has generated, so it may differ slightly from the number Claude Code shows on the agent's row.
 - A background shell is marked finished when its completion notice reaches the conversation.
 - Finished foreground tool calls are listed only if they took 3 seconds or more.
+- The per-model weekly limits (Fable, Opus, Sonnet) do not show: Claude Code passes mods only the 5-hour and weekly windows. The meter already reads the per-model ones (`seven_day_overage_included` for Fable, `seven_day_opus`, `seven_day_sonnet`) and shows them as soon as Claude Code reports them; `/task-monitor limits` lists what it reports today.
 - Memory is the Claude Code process alone, not the MCP servers or shells it starts. On macOS it is the footprint Activity Monitor shows (read with `footprint`), and `swap` counts memory that is swapped out or compressed, since macOS does not tell the two apart per process. On Linux it is the resident set and `VmSwap` from `/proc`.
 - `free` is what Activity Monitor would leave: physical memory less its Memory Used (app memory, wired, compressed), from `vm_stat`; on Linux, `MemAvailable`.
 
