@@ -1,13 +1,16 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TurnUsage } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit, TurnUsage } from 'claude-code'
 
-import type { MainTurn, Meter, Task, TaskStatus, Totals } from '../types'
+import type { MainTurn, Memory, Meter, Task, TaskStatus, Todo, Totals } from '../types'
 
 const PANE = 'task-monitor'
 const TITLE = 'Tasks'
 const KEEP_FINISHED = 8
 const STORE_PANE_HIDDEN = 'paneHidden'
+const PANE_ARGS = { id: PANE, title: TITLE, backgroundColor: 'transparent' } as const
 const STORE_METER_HIDDEN = 'meterHidden'
+const STORE_COLLAPSED = 'collapsed'
+const STORE_METER_COMPACT = 'meterCompact'
 // A finished foreground tool call stays listed only when it took this long.
 const NOTABLE_TOOL_MS = 3000
 
@@ -20,7 +23,14 @@ const main = atom({ plugin: 'task-monitor', key: 'main' } as const, null, {
 const meter = atom({ plugin: 'task-monitor', key: 'meter' } as const, null, {
   shape: 'meter-1',
 })
+const todos = atom({ plugin: 'task-monitor', key: 'todos' } as const, [], { shape: 'todos-1' })
+// Sections of the pane the person has folded: 'plan', 'fg', 'bg', 'done'.
+const collapsed = atom({ plugin: 'task-monitor', key: 'collapsed' } as const, [], {
+  shape: 'collapsed-1',
+})
+const meterCompact = atom({ plugin: 'task-monitor', key: 'meterCompact' } as const, false)
 const meterHidden = atom({ plugin: 'task-monitor', key: 'meterHidden' } as const, false)
+const memory = atom({ plugin: 'task-monitor', key: 'memory' } as const, null, { shape: 'memory-1' })
 const totals = atom(
   { plugin: 'task-monitor', key: 'totals' } as const,
   { input: 0, output: 0 },
@@ -54,10 +64,38 @@ function levelColor(percent: number): 'success' | 'warning' | 'error' {
   return 'success'
 }
 
+// Time left until a limit resets: "42m", "2h 14m", "3d 4h".
+function fmtUntil(ms: number): string {
+  const m = Math.max(1, Math.ceil(ms / 60_000))
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ${m % 60}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+// "340 MB", "1.2 GB", in the units Activity Monitor uses (1 MB = 1024 KB).
+function fmtBytes(n: number): string {
+  const mb = n / 1024 / 1024
+  if (mb < 1024) return `${Math.round(mb)} MB`
+  return `${(mb / 1024).toFixed(1)} GB`
+}
+
 const SPIN = ['◐', '◓', '◑', '◒']
 
+/** An indeterminate "working" strip: a short block sweeping across `cells`. */
+function sweep(frame: number, cells: number): [string, string, string] {
+  const size = 3
+  const span = cells + size
+  const head = frame % span
+  const start = Math.max(0, head - size)
+  const end = Math.min(cells, head)
+  return ['─'.repeat(start), '━'.repeat(Math.max(0, end - start)), '─'.repeat(cells - Math.max(end, start))]
+}
+
 function toolLabel(e: Record<string, unknown>, tool: string): string {
-  for (const field of ['description', 'file_path', 'pattern', 'url', 'query', 'command', 'prompt']) {
+  const description = e.description
+  if (typeof description === 'string' && description.trim() !== '') return description.replace(/\s+/g, ' ').trim()
+  for (const field of ['file_path', 'pattern', 'url', 'query', 'command', 'prompt']) {
     const value = e[field]
     if (typeof value === 'string' && value.trim() !== '') {
       const text = field === 'file_path' ? (value.split('/').pop() ?? value) : value
@@ -104,15 +142,94 @@ async function finish($: EngineInterface, id: string, status: TaskStatus) {
 
 async function refreshMeter($: EngineInterface) {
   const usage = await $.session.usage()
-  const five = usage.rateLimits.find(r => r.kind === 'five_hour')
-  const next: Meter = {
-    contextTokens: usage.context.tokens,
-    contextWindow: usage.context.window,
-    contextPercent: usage.context.percent,
+  const next = meterOf(usage.context, usage.rateLimits)
+  await update($, meter, () => next)
+}
+
+// Per-model weekly windows, as Claude Code names them in its limit notices
+// ("Fable limit" is the `seven_day_overage_included` window).
+const MODEL_LIMITS = [
+  { kind: 'seven_day_overage_included', label: 'fable', short: 'fb' },
+  { kind: 'seven_day_opus', label: 'opus', short: 'op' },
+  { kind: 'seven_day_sonnet', label: 'sonnet', short: 'sn' },
+] as const
+
+function meterOf(
+  context: { tokens?: number; window: number; percent?: number },
+  limits: SessionRateLimit[],
+): Meter {
+  const five = limits.find(r => r.kind === 'five_hour')
+  const week = limits.find(r => r.kind === 'seven_day')
+  return {
+    contextTokens: context.tokens,
+    contextWindow: context.window,
+    contextPercent: context.percent,
     fiveHourPercent: five?.percentUsed,
     fiveHourResetsAt: five?.resetsAt,
+    weekPercent: week?.percentUsed,
+    weekResetsAt: week?.resetsAt,
+    models: limits
+      .filter(r => MODEL_LIMITS.some(l => l.kind === r.kind))
+      .map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
   }
-  await update($, meter, () => next)
+}
+
+// Reads the memory of the Claude Code process. Commands run as its children,
+// so the shell walks up from its parent to the process named `claude` (or a
+// version number, as the native build's binary is), and takes its parent when
+// none matches. macOS: `footprint` (Activity Monitor's figure, and the part
+// swapped or compressed); Linux: /proc's resident set and swap; else `ps`.
+// A second line holds the machine's memory: its total and what is still
+// available. macOS: the total less what Activity Monitor calls Memory Used
+// (app memory, wired, compressed); Linux: MemAvailable.
+const MEMORY_SCRIPT = `
+p=$PPID; i=0; found=
+while [ "$i" -lt 6 ] && [ -n "$p" ] && [ "$p" -gt 1 ]; do
+  c=$(ps -o comm= -p "$p" 2>/dev/null); c=\${c##*/}
+  case "$c" in claude|claude-code|[0-9]*.[0-9]*.[0-9]*) found=$p; break;; esac
+  p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); i=$((i+1))
+done
+p=\${found:-$PPID}
+if [ -r "/proc/$p/status" ]; then
+  awk -v p="$p" '/^VmRSS:/{r=$2*1024} /^VmSwap:/{s=$2*1024} END{print p, r+0, s+0}' "/proc/$p/status"
+elif out=$(footprint --swapped -f bytes "$p" 2>/dev/null | awk '$NF=="TOTAL"{print $1, $3; exit}') && [ -n "$out" ]; then
+  echo "$p $out"
+else
+  echo "$p $(( $(ps -o rss= -p "$p" | tr -d ' ') * 1024 )) 0"
+fi
+if [ -r /proc/meminfo ]; then
+  awk '/^MemTotal:/{t=$2*1024} /^MemAvailable:/{a=$2*1024} END{printf "%.0f %.0f\\n", t, a}' /proc/meminfo
+else
+  vm_stat 2>/dev/null | awk -v t="$(sysctl -n hw.memsize 2>/dev/null)" '
+    /page size of/ {for (i = 1; i <= NF; i++) if ($i == "of") ps = $(i + 1)}
+    /^Anonymous pages/ {gsub(/\\./, "", $NF); an = $NF}
+    /^Pages purgeable/ {gsub(/\\./, "", $NF); pu = $NF}
+    /^Pages wired down/ {gsub(/\\./, "", $NF); w = $NF}
+    /^Pages occupied by compressor/ {gsub(/\\./, "", $NF); c = $NF}
+    END {if (t > 0 && ps > 0) {a = t - (an - pu + w + c) * ps; if (a < 0) a = 0; printf "%.0f %.0f\\n", t, a}}'
+fi
+`
+
+async function sampleMemory($: EngineInterface): Promise<void> {
+  const { exitCode, stdout } = await $.process.run(['/bin/sh', '-c', MEMORY_SCRIPT], { timeoutMs: 5000 })
+  const [own = '', system = ''] = stdout.trim().split('\n')
+  const [pid, bytes, swapped] = own.trim().split(/\s+/).map(Number)
+  if (exitCode !== 0 || !Number.isFinite(pid) || !Number.isFinite(bytes) || !(bytes! > 0)) return
+  const [total, available] = system.trim().split(/\s+/).map(Number)
+  const hasSystem = Number.isFinite(total) && Number.isFinite(available) && total! > 0
+  const value: Memory = {
+    pid: pid!,
+    bytes: bytes!,
+    swapped: Number.isFinite(swapped) ? swapped! : 0,
+    ...(hasSystem && { systemTotal: total!, systemAvailable: available! }),
+  }
+  await update($, memory, () => value)
+}
+
+async function toggleCompact($: EngineInterface): Promise<boolean> {
+  const isCompact = await update($, meterCompact, v => !v)
+  await $.store.set(STORE_METER_COMPACT, isCompact)
+  return isCompact
 }
 
 function textOf(content: unknown): string {
@@ -130,6 +247,11 @@ function textOf(content: unknown): string {
 // ── the mod ─────────────────────────────────────────────────────────────────
 
 export const register: Register = on => {
+  // Columns the docked pane takes from the screen. The hint line under the
+  // prompt is only told the transcript column's width, which a docked pane
+  // narrows, so the meter adds this back to reach the screen's right edge.
+  let dockColumns = 0
+
   // Background flag of agents about to start, by description: a foreground
   // agent's spawn may resolve only when it ends, so `turn.start` reads this.
   const pendingBackground = new Map<string, boolean>()
@@ -137,18 +259,40 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'task-monitor',
-      description: 'Show or hide the tasks panel; "/task-monitor meter" shows or hides the usage meter',
-      argumentHint: '[meter]',
+      description: 'Show or hide the tasks panel; "meter" shows or hides the usage meter, "compact" shrinks or expands it',
+      argumentHint: '[meter|compact|limits]',
     })
     const isMeterHidden = (await $.store.get(STORE_METER_HIDDEN)) === true
     await update($, meterHidden, () => isMeterHidden)
-    if ((await $.store.get(STORE_PANE_HIDDEN)) !== true) void $.ui.open({ id: PANE, title: TITLE })
-    void refreshMeter($).catch(() => undefined)
+    const isMeterCompact = (await $.store.get(STORE_METER_COMPACT)) === true
+    await update($, meterCompact, () => isMeterCompact)
+    const folded = await $.store.get(STORE_COLLAPSED)
+    if (Array.isArray(folded)) {
+      const ids = folded.filter((x): x is string => typeof x === 'string')
+      await update($, collapsed, () => ids)
+    }
+    if ((await $.store.get(STORE_PANE_HIDDEN)) !== true) void $.ui.open(PANE_ARGS)
+    $.ui.status(undefined)
+    await refreshMeter($).catch(() => undefined)
+    void sampleMemory($).catch(() => undefined)
 
     // While something runs, redraw each second so the clocks tick; and ask
     // the engine whether any agent we still show as running has ended.
+    // Every 30 s, even when idle, so the reset countdowns stay current; and
+    // once a window has reset, read the fresh usage.
+    let ticks = 0
     $.clock.every(1000, () => {
       void (async () => {
+        ticks += 1
+        if (ticks % 5 === 0) await sampleMemory($).catch(() => undefined)
+        if (ticks % 30 === 0) {
+          const m = await read($, meter)
+          const now = await $.clock.now()
+          const isPast = (at?: string) => at !== undefined && Date.parse(at) <= now
+          if (m !== null && (isPast(m.fiveHourResetsAt) || isPast(m.weekResetsAt) || (m.models ?? []).some(w => isPast(w.resetsAt))))
+            await refreshMeter($).catch(() => undefined)
+          $.ui.invalidate('ui.render')
+        }
         const list = await read($, tasks)
         const turn = await read($, main)
         const isLive =
@@ -183,7 +327,23 @@ export const register: Register = on => {
       await $.store.set(STORE_METER_HIDDEN, isHidden)
       return { text: isHidden ? 'Usage meter hidden. "/task-monitor meter" brings it back.' : 'Usage meter shown.' }
     }
-    if (arg !== '') return { text: 'Usage: /task-monitor to show or hide the panel, /task-monitor meter for the usage meter.' }
+    if (arg === 'limits') {
+      const usage = await $.session.usage()
+      if (usage.rateLimits.length === 0) return { text: 'Claude Code reports no usage limits for this session.' }
+      const lines = usage.rateLimits.map(r => {
+        const at = r.resetsAt === undefined ? NaN : Date.parse(r.resetsAt)
+        return `${r.kind}: ${r.percentUsed}%${Number.isNaN(at) ? '' : `, resets ${r.resetsAt}`}`
+      })
+      return { text: `Usage limits as Claude Code reports them:\n${lines.join('\n')}` }
+    }
+    if (arg === 'compact') {
+      const isCompact = await toggleCompact($)
+      return { text: isCompact ? 'Usage meter compact.' : 'Usage meter in full.' }
+    }
+    if (arg !== '')
+      return {
+        text: 'Usage: /task-monitor to show or hide the panel, /task-monitor meter to show or hide the usage meter, /task-monitor compact to shrink or expand it, /task-monitor limits to list every usage limit.',
+      }
 
     const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
     if (isOpen) {
@@ -192,7 +352,7 @@ export const register: Register = on => {
       return { text: 'Tasks panel hidden; it stays hidden in new sessions until "/task-monitor".' }
     }
     await $.store.set(STORE_PANE_HIDDEN, false)
-    const opened = await $.ui.open({ id: PANE, title: TITLE })
+    const opened = await $.ui.open(PANE_ARGS)
     return {
       text: opened.isPlaced ? 'Tasks panel shown.' : 'The tasks panel will show once the terminal has room.',
     }
@@ -201,6 +361,7 @@ export const register: Register = on => {
   // Closing the pane by hand (its close mark, ctrl+x x) keeps it closed in
   // later sessions too, until "/task-monitor" shows it again.
   on('ui.close', async ($, e, next) => {
+    if (e.id === PANE) dockColumns = 0
     if (e.id === PANE && e.origin.kind === 'person') await $.store.set(STORE_PANE_HIDDEN, true)
     return next(e)
   })
@@ -210,20 +371,14 @@ export const register: Register = on => {
       await update($, tasks, () => [])
       await update($, main, () => null)
       await update($, totals, () => ({ input: 0, output: 0 }))
+      await update($, todos, () => [])
     }
     return next(e)
   })
 
   // ── usage meter ──
   on('session.measure', async ($, e, next) => {
-    const five = e.rateLimits.find(r => r.kind === 'five_hour')
-    const value: Meter = {
-      contextTokens: e.context.tokens,
-      contextWindow: e.context.window,
-      contextPercent: e.context.percent,
-      fiveHourPercent: five?.percentUsed,
-      fiveHourResetsAt: five?.resetsAt,
-    }
+    const value = meterOf(e.context, e.rateLimits)
     await update($, meter, () => value)
     return next(e)
   })
@@ -327,6 +482,48 @@ export const register: Register = on => {
     const args = e as unknown as Record<string, unknown>
     const label = toolLabel(args, tool)
 
+    // The main conversation's to-do list: the plan the progress bar measures.
+    if (e.agentId === undefined && (tool === 'TodoWrite' || tool === 'TaskCreate' || tool === 'TaskUpdate')) {
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError === true) return ran
+      if (tool === 'TodoWrite' && Array.isArray(args.todos)) {
+        const list = (args.todos as { content?: unknown; status?: unknown; activeForm?: unknown }[]).map((t, i) => ({
+          id: `todo-${i}`,
+          subject: String(t.content ?? ''),
+          activeForm: typeof t.activeForm === 'string' ? t.activeForm : undefined,
+          status: t.status === 'completed' || t.status === 'in_progress' ? t.status : 'pending',
+        }) satisfies Todo)
+        await update($, todos, () => list)
+      } else if (tool === 'TaskCreate') {
+        const created = (ran.result as { task?: { id?: unknown; subject?: unknown } } | undefined)?.task
+        const id = typeof created?.id === 'string' ? created.id : `task-${e.tool_use_id}`
+        const subject = typeof args.subject === 'string' ? args.subject : String(created?.subject ?? 'Task')
+        const activeForm = typeof args.activeForm === 'string' ? args.activeForm : undefined
+        const item: Todo = { id, subject, activeForm, status: 'pending' }
+        await update($, todos, list => [...list.filter(t => t.id !== id), item])
+      } else if (tool === 'TaskUpdate' && typeof args.taskId === 'string') {
+        const id = args.taskId
+        await update($, todos, list =>
+          args.status === 'deleted'
+            ? list.filter(t => t.id !== id)
+            : list.map(t =>
+                t.id !== id
+                  ? t
+                  : {
+                      ...t,
+                      subject: typeof args.subject === 'string' ? args.subject : t.subject,
+                      activeForm: typeof args.activeForm === 'string' ? args.activeForm : t.activeForm,
+                      status:
+                        args.status === 'completed' || args.status === 'in_progress' || args.status === 'pending'
+                          ? args.status
+                          : t.status,
+                    },
+              ),
+        )
+      }
+      return ran
+    }
+
     if (tool === 'TaskStop') {
       const ran = await next(e)
       const id = typeof args.task_id === 'string' ? args.task_id : typeof args.shell_id === 'string' ? args.shell_id : undefined
@@ -429,17 +626,40 @@ export const register: Register = on => {
 
   // ── drawing: the pane ──
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
+    const folded = await read($, collapsed)
+    const isOpen = (id: string) => !folded.includes(id)
+    const toggle = async (id: string) => {
+      const next = await update($, collapsed, list =>
+        list.includes(id) ? list.filter(x => x !== id) : [...list, id],
+      )
+      await $.store.set(STORE_COLLAPSED, next)
+    }
     const list = await read($, tasks)
     const turn = await read($, main)
-    const spin = SPIN[Math.floor(now / 1000) % SPIN.length] ?? '◐'
+    const plan = await read($, todos)
+    const mem = await read($, memory)
+    const frame = Math.floor(now / 1000)
+    const spin = SPIN[frame % SPIN.length] ?? '◐'
+    const width = Math.max(20, e.props.bodyColumns - 3)
+    // The pane's frame (border and gap) takes three columns beyond its body.
+    const docked = e.props.placement === 'dock' ? e.props.bodyColumns + 3 : 0
+    if (docked !== dockColumns) {
+      dockColumns = docked
+      $.ui.invalidate('ui.render')
+    }
 
     const isLive = (t: Task) => t.status === 'running' || t.status === 'waiting'
     const fg = list.filter(t => isLive(t) && !t.isBackground)
     const bg = list.filter(t => isLive(t) && t.isBackground)
     const ended = list.filter(t => !isLive(t))
     const isMainRunning = turn !== null && turn.endedAt === undefined
+    const doneCount = plan.filter(t => t.status === 'completed').length
+    const showPlan = plan.length > 0 && (doneCount < plan.length || isMainRunning)
+
+    let rows = 0
+    const kindOf = (task: Task) => (task.id === 'main' ? task.detail : task.kind === 'shell' ? 'bash' : task.detail.toLowerCase())
 
     const Row = ({ task }: { task: Task }) => {
       const live = isLive(task)
@@ -464,7 +684,6 @@ export const register: Register = on => {
             : 'error'
       const elapsed = fmtDuration((task.endedAt ?? now) - task.startedAt)
       const tokens = task.kind === 'agent' && task.context + task.output > 0 ? fmtTokens(task.context + task.output) : ''
-      const kind = task.kind === 'agent' ? task.detail : task.kind === 'shell' ? 'bash' : task.detail
       const sub =
         task.kind === 'agent'
           ? [task.activity ?? (task.status === 'waiting' ? 'waiting' : undefined), tokens && `${tokens} tok`, task.steps > 0 && `${task.steps} ${task.steps === 1 ? 'step' : 'steps'}`]
@@ -472,6 +691,8 @@ export const register: Register = on => {
             ? [task.detail]
             : []
       const subline = sub.filter(Boolean).join(' · ')
+      const [before, block, after] = sweep(frame, 10)
+      rows += live ? 3 : 1
 
       return (
         <Box flexDirection="column" marginBottom={live ? 1 : 0}>
@@ -480,12 +701,12 @@ export const register: Register = on => {
               <Text color={glyphColor}>{glyph} </Text>
             </Box>
             <Box flexGrow={1} flexShrink={1}>
-              <Text wrap="truncate-end" dimColor={!live}>
-                <Text bold={live} color={live ? 'text' : undefined}>{task.label}</Text>
+              <Text wrap="truncate-end" bold={live} dimColor={!live}>
+                {task.label}
               </Text>
             </Box>
             <Box flexShrink={0} marginLeft={1}>
-              {!live && tokens !== '' && <Text dimColor>{tokens}  </Text>}
+              {!live && <Text dimColor>{tokens !== '' ? `${tokens} · ` : ''}{kindOf(task)}  </Text>}
               <Text color={live ? accent : undefined} dimColor={!live} bold={live} tabular>
                 {elapsed}
               </Text>
@@ -493,61 +714,110 @@ export const register: Register = on => {
           </Box>
           {live && (
             <Box flexDirection="row" paddingLeft={2}>
-              <Text color={accent} dimColor>{kind}</Text>
-              {subline !== '' && <Text dimColor wrap="truncate-end"> ⎿ {subline}</Text>}
+              <Box flexShrink={0}>
+                {task.status === 'waiting' ? (
+                  <Text dimColor>{'─'.repeat(10)} </Text>
+                ) : (
+                  <Text>
+                    <Text dimColor>{before}</Text>
+                    <Text color={accent} bold>{block}</Text>
+                    <Text dimColor>{after} </Text>
+                  </Text>
+                )}
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text dimColor wrap="truncate-end">
+                  {kindOf(task)}
+                  {subline !== '' ? ` · ${subline}` : ''}
+                </Text>
+              </Box>
             </Box>
           )}
         </Box>
       )
     }
 
-    const Heading = ({ text, count, color }: { text: string; count: number; color: string }) => (
-      <Box flexDirection="row" marginBottom={1}>
-        <Text bold color={color}>{text}</Text>
-        <Text dimColor> {count}</Text>
-      </Box>
-    )
+    // A section's title is a button: a click, or Enter under the focus,
+    // folds the section to its title line and opens it again.
+    const Heading = ({ id, text, count, color }: { id: string; text: string; count: string; color: string }) => {
+      const open = isOpen(id)
+      rows += open ? 2 : 1
+      return (
+        <Box flexDirection="row" marginBottom={open ? 1 : 0}>
+          <Button key={`section-${id}`} plain onPress={() => void toggle(id)}>
+            <Text color={color}>{open ? '▾ ' : '▸ '}</Text>
+            <Text bold color={color}>{text}</Text>
+            <Text dimColor> {count}</Text>
+          </Button>
+        </Box>
+      )
+    }
 
     const fgCount = fg.length + (isMainRunning ? 1 : 0)
-    const nothing = fgCount === 0 && bg.length === 0 && ended.length === 0
+    const nothing = fgCount === 0 && bg.length === 0 && ended.length === 0 && !showPlan
 
-    return (
-      <Box flexDirection="column" paddingX={1}>
+    const planPercent = plan.length === 0 ? 0 : Math.round((doneCount / plan.length) * 100)
+    const [planOn, planOff] = bar(planPercent, Math.max(8, width - 6))
+
+    const body = (
+      <Box flexDirection="column" flexGrow={1} flexShrink={1} paddingLeft={1}>
         {nothing && (
           <Box flexDirection="column">
             <Text bold color="claude">Nothing running</Text>
             <Text dimColor wrap="wrap">
-              The conversation, subagents, background commands and long tool calls show up here, with their time and tokens.
+              The plan, the conversation, subagents, background commands and long tool calls show up here, with their time and tokens.
             </Text>
+          </Box>
+        )}
+
+        {showPlan && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Heading id="plan" text="Plan" count={`${doneCount}/${plan.length}`} color="claude" />
+            <Box flexDirection="row" marginBottom={1}>
+              <Text color={doneCount === plan.length ? 'success' : 'claude'}>{planOn}</Text>
+              <Text dimColor>{planOff}</Text>
+              <Text bold color={doneCount === plan.length ? 'success' : 'claude'}> {planPercent}%</Text>
+            </Box>
+            {isOpen('plan') && plan.map(item => {
+              rows += 1
+              const isDone = item.status === 'completed'
+              const isNow = item.status === 'in_progress'
+              return (
+                <Box key={item.id} flexDirection="row">
+                  <Box flexShrink={0}>
+                    <Text color={isDone ? 'success' : isNow ? 'claude' : undefined} dimColor={!isDone && !isNow}>
+                      {isDone ? '✓' : isNow ? spin : '○'}{' '}
+                    </Text>
+                  </Box>
+                  <Text wrap="truncate-end" bold={isNow} dimColor={isDone || !isNow} strikethrough={isDone}>
+                    {isNow ? (item.activeForm ?? item.subject) : item.subject}
+                  </Text>
+                </Box>
+              )
+            })}
           </Box>
         )}
 
         {fgCount > 0 && (
           <Box flexDirection="column">
-            <Heading text="Foreground" count={fgCount} color="claude" />
-            {isMainRunning && turn !== null && (
-              <Box flexDirection="column" marginBottom={1}>
-                <Box flexDirection="row">
-                  <Box flexShrink={0}>
-                    <Text color="claude">{spin} </Text>
-                  </Box>
-                  <Box flexGrow={1} flexShrink={1}>
-                    <Text bold wrap="truncate-end">Conversation</Text>
-                  </Box>
-                  <Box flexShrink={0} marginLeft={1}>
-                    <Text color="claude" bold tabular>{fmtDuration(now - turn.startedAt)}</Text>
-                  </Box>
-                </Box>
-                <Box paddingLeft={2}>
-                  <Text dimColor wrap="truncate-end">
-                    {turn.steps === 0
-                      ? 'waiting for the model'
-                      : `${turn.steps} ${turn.steps === 1 ? 'step' : 'steps'} · ctx ${fmtTokens(turn.context)} · ${fmtTokens(turn.output)} out`}
-                  </Text>
-                </Box>
-              </Box>
+            <Heading id="fg" text="Foreground" count={String(fgCount)} color="claude" />
+            {isOpen('fg') && isMainRunning && turn !== null && (
+              <Row
+                task={{
+                  id: 'main',
+                  kind: 'agent',
+                  label: 'Conversation',
+                  detail: `${turn.steps} ${turn.steps === 1 ? 'step' : 'steps'} · ctx ${fmtTokens(turn.context)} · ${fmtTokens(turn.output)} out`,
+                  isBackground: false,
+                  status: 'running',
+                  startedAt: turn.startedAt,
+                  context: 0,
+                  output: 0,
+                  steps: 0,
+                }}
+              />
             )}
-            {fg.map(t => (
+            {isOpen('fg') && fg.map(t => (
               <Row key={t.id} task={t} />
             ))}
           </Box>
@@ -555,8 +825,8 @@ export const register: Register = on => {
 
         {bg.length > 0 && (
           <Box flexDirection="column">
-            <Heading text="Background" count={bg.length} color="suggestion" />
-            {bg.map(t => (
+            <Heading id="bg" text="Background" count={String(bg.length)} color="suggestion" />
+            {isOpen('bg') && bg.map(t => (
               <Row key={t.id} task={t} />
             ))}
           </Box>
@@ -564,12 +834,57 @@ export const register: Register = on => {
 
         {ended.length > 0 && (
           <Box flexDirection="column">
-            <Heading text="Finished" count={ended.length} color="subtle" />
-            {ended.map(t => (
+            <Heading id="done" text="Finished" count={String(ended.length)} color="subtle" />
+            {isOpen('done') && ended.map(t => (
               <Row key={t.id} task={t} />
             ))}
           </Box>
         )}
+      </Box>
+    )
+
+    // The session's memory, small and dim, pinned to the panel's bottom
+    // edge; the swapped part only when there is some (at least 1 MB). Under
+    // it, the machine's memory still available, amber under 20% and red under
+    // 10%.
+    const hasSwap = mem !== null && mem.swapped >= 1024 * 1024
+    const total = mem?.systemTotal
+    const available = mem?.systemAvailable
+    const hasSystem = total !== undefined && available !== undefined
+    const freeShare = hasSystem ? available / total : 1
+    const freeColor = freeShare < 0.1 ? 'error' : freeShare < 0.2 ? 'warning' : undefined
+    const memLines = mem !== null && (
+      <Box flexDirection="column" flexShrink={0} paddingLeft={1} alignItems="flex-end">
+        <Box flexDirection="row">
+          <Text dimColor>mem </Text>
+          <Text dimColor bold tabular>{fmtBytes(mem.bytes)}</Text>
+          {hasSwap && <Text dimColor>  swap </Text>}
+          {hasSwap && <Text color="warning" tabular>{fmtBytes(mem.swapped)}</Text>}
+        </Box>
+        {hasSystem && (
+          <Box flexDirection="row">
+            <Text dimColor>free </Text>
+            <Text color={freeColor} dimColor={freeColor === undefined} bold tabular>{fmtBytes(available)}</Text>
+            <Text dimColor> of {fmtBytes(total)}</Text>
+          </Box>
+        )}
+      </Box>
+    )
+
+    // The divider: a bold accent rule down the panel's left edge, as tall as
+    // the panel or its content, whichever is taller.
+    const height = Math.max(e.props.scroll.bodyRows, rows + (nothing ? 3 : 2) + (mem === null ? 0 : hasSystem ? 3 : 2))
+    return (
+      <Box flexDirection="row">
+        <Box flexDirection="column" flexShrink={0}>
+          <Text color="claude" bold>
+            {Array.from({ length: height }, () => '┃').join('\n')}
+          </Text>
+        </Box>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} height={height}>
+          {body}
+          {memLines}
+        </Box>
       </Box>
     )
   })
@@ -579,12 +894,14 @@ export const register: Register = on => {
     if (await read($, meterHidden)) return next(e)
     const m = await read($, meter)
     const sum = await read($, totals)
-    const columns = e.viewport?.columns ?? 80
     if (m === null && sum.input + sum.output === 0) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
-    const isWide = columns >= 110
-    const isRoomy = columns >= 90
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const isCompact = await read($, meterCompact)
+    const screen = (e.viewport?.columns ?? 80) + dockColumns
+    // Compact: percentages and the 5h reset only, no bars or token counts.
+    const isWide = !isCompact && screen >= 120
+    const isRoomy = !isCompact && screen >= 90
 
     const parts: unknown[] = []
     const dot = (k: string) => (
@@ -593,7 +910,7 @@ export const register: Register = on => {
       </Text>
     )
 
-    if (sum.input + sum.output > 0) {
+    if (isRoomy && sum.input + sum.output > 0) {
       parts.push(
         <Text key="tok">
           <Text dimColor>tokens </Text>
@@ -605,29 +922,40 @@ export const register: Register = on => {
       )
     }
 
-    if (m?.fiveHourPercent !== undefined) {
-      const p = Math.round(m.fiveHourPercent)
-      const [on5, off5] = bar(p, 5)
-      if (parts.length > 0) parts.push(dot('d1'))
+    const now = await $.clock.now()
+    const limit = (key: string, label: string, short: string, percent?: number, resetsAt?: string) => {
+      if (percent === undefined) return
+      const at = resetsAt === undefined ? NaN : Date.parse(resetsAt)
+      const hasReset = at <= now
+      const p = hasReset ? 0 : Math.round(percent)
+      const [filled, empty] = bar(p, 5)
+      if (parts.length > 0) parts.push(dot(`d-${key}`))
       parts.push(
-        <Text key="5h">
-          <Text dimColor>5h </Text>
-          {isRoomy && <Text color={levelColor(p)}>{on5}</Text>}
-          {isRoomy && <Text dimColor>{off5} </Text>}
+        <Text key={key}>
+          <Text dimColor>{isCompact ? short : label} </Text>
+          {isRoomy && <Text color={levelColor(p)}>{filled}</Text>}
+          {isRoomy && <Text dimColor>{empty} </Text>}
           <Text color={levelColor(p)} bold>{p}%</Text>
+          {at > now && (!isCompact || key === '5h') && <Text dimColor> ↻ {fmtUntil(at - now)}</Text>}
         </Text>,
       )
+    }
+    limit('5h', '5h', '5h', m?.fiveHourPercent, m?.fiveHourResetsAt)
+    limit('wk', 'week', 'wk', m?.weekPercent, m?.weekResetsAt)
+    for (const l of MODEL_LIMITS) {
+      const w = m?.models?.find(r => r.kind === l.kind)
+      if (w !== undefined) limit(l.kind, l.label, l.short, w.percentUsed, w.resetsAt)
     }
 
     if (m !== null) {
       const p = m.contextPercent ?? 0
-      const [onC, offC] = bar(p, isWide ? 10 : 6)
-      if (parts.length > 0) parts.push(dot('d2'))
+      const [onC, offC] = isCompact ? ['', ''] : bar(p, isWide ? 10 : 6)
+      if (parts.length > 0) parts.push(dot('d-ctx'))
       parts.push(
         <Text key="ctx">
-          <Text dimColor>context </Text>
-          <Text color={levelColor(p)}>{onC}</Text>
-          <Text dimColor>{offC} </Text>
+          <Text dimColor>{isCompact ? 'ctx' : 'context'} </Text>
+          {!isCompact && <Text color={levelColor(p)}>{onC}</Text>}
+          {!isCompact && <Text dimColor>{offC} </Text>}
           <Text color={levelColor(p)} bold>{Math.round(p)}%</Text>
           {isWide && (
             <Text dimColor>
@@ -639,12 +967,18 @@ export const register: Register = on => {
       )
     }
 
+    // The hint line is indented two columns; keep two more clear at the edge.
     const engine = await next(e)
     return (
-      <Box flexDirection="row" justifyContent="space-between">
+      <Box flexDirection="column">
         {engine}
-        <Box flexShrink={0} marginLeft={2}>
+        <Box flexDirection="row" justifyContent="flex-end" width={Math.max(20, screen - 4)}>
           {parts as never}
+          <Box marginLeft={2}>
+            <Button key="meter-size" label={isCompact ? 'Expand the usage meter' : 'Compact the usage meter'} plain dimColor onPress={() => void toggleCompact($)}>
+              {isCompact ? '+' : '−'}
+            </Button>
+          </Box>
         </Box>
       </Box>
     )

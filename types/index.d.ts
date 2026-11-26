@@ -33,9 +33,32 @@ export type Meter = {
   contextPercent?: number
   fiveHourPercent?: number
   fiveHourResetsAt?: string
+  weekPercent?: number
+  weekResetsAt?: string
+  // Model windows beside the weekly one (Fable, Opus, Sonnet), when the plan has them.
+  models?: { kind: string; percentUsed: number; resetsAt?: string }[]
 }
 
 export type Totals = { input: number; output: number }
+
+/** The Claude Code process's memory, as the system reports it. */
+export type Memory = {
+  pid: number
+  /** Memory in use: the footprint Activity Monitor shows on macOS, the resident set on Linux. */
+  bytes: number
+  /** Of it, swapped out (on macOS also compressed: the system does not tell the two apart per process). */
+  swapped: number
+  /** The machine's physical memory, and how much of it is still available. */
+  systemTotal?: number
+  systemAvailable?: number
+}
+
+export type Todo = {
+  id: string
+  subject: string
+  activeForm?: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -45,6 +68,10 @@ declare module 'claude-code' {
       meter: Shaped<Meter | null>
       totals: Shaped<Totals>
       meterHidden: boolean
+      meterCompact: boolean
+      todos: Shaped<Todo[]>
+      collapsed: Shaped<string[]>
+      memory: Shaped<Memory | null>
     }
   }
 }
